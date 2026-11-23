@@ -54,7 +54,10 @@ impl<T> Drop for RefGuardBlocking<'_, T> {
         // SAFETY: guard is dropped exactly once, here, while state is guarded by `_tracker_guard` preventing access from any other thread.
         unsafe { ManuallyDrop::drop(&mut self.inner) };
 
-        self.mut_condition.notify_one();
+        // Waiters are counted under `state_lock`, so none can start waiting between this check and the notify.
+        if state_lock.has_mut_waiters() {
+            self.mut_condition.notify_one();
+        }
         drop(state_lock);
     }
 }
@@ -104,13 +107,18 @@ impl<T> DerefMut for MutGuardBlocking<'_, T> {
 
 impl<T> Drop for MutGuardBlocking<'_, T> {
     fn drop(&mut self) {
-        let _tracker_guard = self.state.lock().unwrap();
+        let tracker_guard = self.state.lock().unwrap();
 
-        // SAFETY: guard is dropped exactly once, here, while state is guarded by `_tracker_guard` preventing access from any other thread.
+        // SAFETY: guard is dropped exactly once, here, while state is guarded by `tracker_guard` preventing access from any other thread.
         unsafe { ManuallyDrop::drop(&mut self.inner) };
 
-        self.mut_condition.notify_one();
-        self.immut_condition.notify_all();
+        // Waiters are counted under `tracker_guard`, so none can start waiting between these checks and the notifies.
+        if tracker_guard.has_mut_waiters() {
+            self.mut_condition.notify_one();
+        }
+        if tracker_guard.has_immut_waiters() {
+            self.immut_condition.notify_all();
+        }
     }
 }
 
