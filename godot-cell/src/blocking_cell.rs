@@ -147,9 +147,12 @@ impl<T> GdCellBlocking<T> {
         &self,
         mut tracker_guard: MutexGuard<'a, ThreadTracker>,
     ) -> MutexGuard<'a, ThreadTracker> {
+        // Counted under the tracker lock, which the guards hold when they drop: a guard notifies `mut_condition` only if a thread waits.
+        tracker_guard.mut_waiters += 1;
         while self.inner.as_ref().is_currently_bound() {
             tracker_guard = self.mut_condition.wait(tracker_guard).unwrap();
         }
+        tracker_guard.mut_waiters -= 1;
 
         tracker_guard
     }
@@ -159,9 +162,12 @@ impl<T> GdCellBlocking<T> {
         &self,
         mut tracker_guard: MutexGuard<'a, ThreadTracker>,
     ) -> MutexGuard<'a, ThreadTracker> {
+        // Counted like `block_mut`'s waiters, for `immut_condition`.
+        tracker_guard.immut_waiters += 1;
         while self.inner.as_ref().is_currently_mutably_bound() {
             tracker_guard = self.immut_condition.wait(tracker_guard).unwrap();
         }
+        tracker_guard.immut_waiters -= 1;
 
         tracker_guard
     }
@@ -187,6 +193,15 @@ pub(crate) struct ThreadTracker {
     ///
     /// `Vec` instead of `HashMap`: #threads concurrently holding a shared borrow on a cell is almost always 0 or 1, so linear search is cheaper.
     shared_counts: Vec<(thread::ThreadId, usize)>,
+
+    /// Number of threads blocked in `GdCellBlocking::block_mut()`, waiting on `mut_condition`.
+    ///
+    /// A guard that drops notifies a condition variable only when a thread waits on it. On Linux, `Condvar::notify_*` is a system call
+    /// even with no waiter, which would otherwise be paid on every borrow of every cell.
+    mut_waiters: usize,
+
+    /// Number of threads blocked in `GdCellBlocking::block_immut()`, waiting on `immut_condition`.
+    immut_waiters: usize,
 }
 
 impl Default for ThreadTracker {
@@ -194,6 +209,8 @@ impl Default for ThreadTracker {
         Self {
             mut_thread: current_thread_id(),
             shared_counts: Vec::new(),
+            mut_waiters: 0,
+            immut_waiters: 0,
         }
     }
 }
@@ -256,5 +273,83 @@ impl ThreadTracker {
     /// Claims the mutable reference for the current thread.
     fn claim_mut_ref(&mut self) {
         self.mut_thread = current_thread_id();
+    }
+
+    /// Returns if any thread is blocked waiting for a mutable borrow.
+    pub fn has_mut_waiters(&self) -> bool {
+        self.mut_waiters > 0
+    }
+
+    /// Returns if any thread is blocked waiting for a shared borrow.
+    pub fn has_immut_waiters(&self) -> bool {
+        self.immut_waiters > 0
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn wait_until(cell: &GdCellBlocking<i32>, waiting: impl Fn(&ThreadTracker) -> bool) {
+        while !waiting(&cell.thread_tracker.lock().unwrap()) {
+            thread::yield_now();
+        }
+    }
+
+    /// A thread blocked on a mutable borrow is woken when another thread's last shared borrow drops.
+    ///
+    /// A lost wake-up would hang this test.
+    #[test]
+    #[cfg_attr(
+        all(target_family = "wasm", not(target_feature = "atomics")),
+        ignore = "Threading not available"
+    )]
+    fn shared_drop_wakes_blocked_mut_borrow() {
+        let cell = GdCellBlocking::new(0);
+
+        thread::scope(|scope| {
+            let shared = cell.borrow().unwrap();
+            let blocked = scope.spawn(|| *cell.borrow_mut().unwrap() += 1);
+
+            wait_until(&cell, |tracker| tracker.mut_waiters == 1);
+            drop(shared);
+            blocked.join().unwrap();
+        });
+
+        assert_eq!(*cell.borrow().unwrap(), 1);
+        assert!(!cell.thread_tracker.lock().unwrap().has_mut_waiters());
+    }
+
+    /// Every thread blocked on a shared or a mutable borrow is woken when another thread's mutable borrow drops.
+    ///
+    /// A lost wake-up would hang this test.
+    #[test]
+    #[cfg_attr(
+        all(target_family = "wasm", not(target_feature = "atomics")),
+        ignore = "Threading not available"
+    )]
+    fn mut_drop_wakes_blocked_borrows() {
+        let cell = GdCellBlocking::new(0);
+
+        thread::scope(|scope| {
+            let mut exclusive = cell.borrow_mut().unwrap();
+            let readers = [(); 2].map(|_| scope.spawn(|| *cell.borrow().unwrap()));
+            let writer = scope.spawn(|| *cell.borrow_mut().unwrap() += 1);
+
+            wait_until(&cell, |tracker| {
+                tracker.immut_waiters == 2 && tracker.mut_waiters == 1
+            });
+            *exclusive = 10;
+            drop(exclusive);
+
+            for reader in readers {
+                assert!(matches!(reader.join().unwrap(), 10 | 11));
+            }
+            writer.join().unwrap();
+        });
+
+        assert_eq!(*cell.borrow().unwrap(), 11);
+        let tracker = cell.thread_tracker.lock().unwrap();
+        assert!(!tracker.has_mut_waiters() && !tracker.has_immut_waiters());
     }
 }
